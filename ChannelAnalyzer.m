@@ -20,6 +20,10 @@ classdef ChannelAnalyzer
         tGainMaxDb                       % Коэффициент усиления главного лепестка ДН [дБ]
         rTempKelvin                      % Шумовая температура приемника [К]
         receiverGainDb                   % Коэффициент усиления приемной антенны [дБ]
+
+        % Параметры АФАР
+        antennaArray                     % Объект Phased Array Toolbox
+        steeringVectorObj                % Объект для расчета фазовых весов
     end
     
     methods
@@ -34,10 +38,17 @@ classdef ChannelAnalyzer
             this.tGainMaxDb = tGainDb;
             this.rTempKelvin = rTempK;
             this.receiverGainDb = rGainDb; 
+            % Создание модели планарной решетки 32x32 элемента с шагом 12 мм и изотропными излучателями
+            this.antennaArray = phased.URA('Element', phased.IsotropicAntennaElement, ...
+                'ElementSpacing', [12e-3 12e-3], ... 
+                'Size', [32 32]);
+            % Инициализация объекта для расчета фазовых весов
+            this.steeringVectorObj = phased.SteeringVector(...
+                'SensorArray', this.antennaArray);
         end
         
         function results = calcLink(this, elevationStartDeg, elevationEndDeg, bandwidthHz)
-            % calcLink - Расчет SNR rfyfkf для диапазона углов места
+            % calcLink - Расчет SNR канала для диапазона углов места
             %
             % ВХОДНЫЕ АРГУМЕНТЫ:
             % elevationStartDeg - Начальный угол места [град]
@@ -50,7 +61,7 @@ classdef ChannelAnalyzer
             %   .snrDb        - Отношение сигнал/шум [дБ]
             
             % Формирование вектора углов места
-            pointCount = 100;
+            pointCount = 4;
             elevationAngleDeg = linspace(elevationStartDeg, elevationEndDeg, pointCount);
             elevationAngleRad = deg2rad(elevationAngleDeg);
             
@@ -84,15 +95,33 @@ classdef ChannelAnalyzer
         end
         
         function snrLinear = calcSnrValues(this, distanceMeters, scanAngleRad, bandwidthHz)
-            % calcSnrValues - Метод для расчета SNR
+            % calcSnrValues - Метод для расчета SNR с использованием Phased Array Toolbox
             
             wavelengthMeters = this.lightSpeedMps / this.carrierFreqHz;
-            
-            tGainMaxLinear = db2pow(this.tGainMaxDb);
             rGainLinear = db2pow(this.receiverGainDb);
             
-            % Учет эффективной площади антенны планарной АФАР
-            tGainEffective = tGainMaxLinear .* cos(scanAngleRad);
+            % Расчет усиления передающей антенны для каждого угла
+            tGainLinear = zeros(size(scanAngleRad));
+            
+            % Переводим углы сканирования в градусы
+            scanAngleDeg = rad2deg(scanAngleRad);
+            
+            % Цикл по всем расчетным углам
+            for angInd = 1:length(scanAngleDeg)
+
+                currentScanAngle = scanAngleDeg(angInd);
+                steeringAngle = [currentScanAngle; 0]; % [Azimuth; Elevation]
+                
+                % Расчет вектора весовых коэффициентов
+                w = this.steeringVectorObj(this.carrierFreqHz, steeringAngle);
+                % КУ антенны в направление терминала
+                gainDbi = pattern(this.antennaArray, this.carrierFreqHz, ...
+                    currentScanAngle, 0, ...
+                    'Weights', w, ...
+                    'Type', 'directivity');
+                
+                tGainLinear(angInd) = db2pow(gainDbi);
+            end
             
             % Потери в свободном пространстве (FSPL)
             freeSpacePathLoss = ((4 * pi * distanceMeters) ./ wavelengthMeters).^2;
@@ -101,11 +130,12 @@ classdef ChannelAnalyzer
             noisePowerWatts = this.boltzmanConstant * this.rTempKelvin * bandwidthHz;
             
             % Мощность принятого сигнала
-            receivedPowerWatts = this.transmitPowerWatts .* tGainEffective .* ...
+            receivedPowerWatts = this.transmitPowerWatts .* tGainLinear .* ...
                 rGainLinear ./ freeSpacePathLoss;
             
             % Итоговый SNR
             snrLinear = receivedPowerWatts ./ noisePowerWatts;
         end
+
     end
 end
